@@ -1,0 +1,325 @@
+import { createServerClient, type CookieOptions } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function middleware(request: NextRequest) {
+  let response = NextResponse.next({
+    request: {
+      headers: request.headers,
+    },
+  })
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return request.cookies.get(name)?.value
+        },
+        set(name: string, value: string, options: CookieOptions) {
+          request.cookies.set({
+            name,
+            value,
+            ...options,
+          })
+          response = NextResponse.next({
+            request: {
+              headers: request.headers,
+            },
+          })
+          response.cookies.set({
+            name,
+            value,
+            ...options,
+          })
+        },
+        remove(name: string, options: CookieOptions) {
+          request.cookies.set({
+            name,
+            value: '',
+            ...options,
+          })
+          response = NextResponse.next({
+            request: {
+            headers: request.headers,
+          },
+          })
+          response.cookies.set({
+            name,
+            value: '',
+            ...options,
+          })
+        },
+      },
+    }
+  )
+
+  // Get user session
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  const { pathname } = request.nextUrl
+
+  // Public routes that don't require authentication
+  const publicRoutes = [
+    '/',
+    '/auth/signin',
+    '/auth/signup', 
+    '/auth/reset-password',
+    '/auth/accept-invitation',
+    '/api/auth/signin',
+    '/api/auth/signup',
+    '/api/auth/password/reset'
+  ]
+
+  // API routes that don't require authentication
+  const publicApiRoutes = [
+    '/api/auth/signin',
+    '/api/auth/signup',
+    '/api/auth/password/reset'
+  ]
+
+  // Protected routes that require specific roles
+  const protectedRoutes = {
+    // Admin only routes
+    admin: [
+      '/admin',
+      '/users/manage',
+      '/api/auth/invite',
+      '/api/users'
+    ],
+    // Clerk and above
+    clerk: [
+      '/enquiries',
+      '/clients',
+      '/assignments',
+      '/api/enquiries',
+      '/api/clients'
+    ],
+    // Any authenticated user
+    authenticated: [
+      '/dashboard',
+      '/profile',
+      '/api/auth/profile',
+      '/api/auth/password/update',
+      '/api/auth/signout'
+    ]
+  }
+
+  // Check if current path is public
+  const isPublicRoute = publicRoutes.some(route => 
+    pathname === route || pathname.startsWith(`${route}/`)
+  )
+
+  const isPublicApiRoute = publicApiRoutes.some(route =>
+    pathname === route || pathname.startsWith(`${route}/`)
+  )
+
+  // If it's a public route, allow access
+  if (isPublicRoute || isPublicApiRoute) {
+    return response
+  }
+
+  // If no user session, redirect to signin
+  if (!user) {
+    // For API routes, return 401
+    if (pathname.startsWith('/api/')) {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Unauthorized',
+          message: 'Authentication required',
+          code: 'AUTH_REQUIRED'
+        }),
+        { 
+          status: 401,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    }
+
+    // For regular routes, redirect to signin
+    const signinUrl = new URL('/auth/signin', request.url)
+    signinUrl.searchParams.set('redirectTo', pathname)
+    return NextResponse.redirect(signinUrl)
+  }
+
+  // Get user profile with role information
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('role, is_active, require_password_change, onboarding_completed')
+    .eq('id', user.id)
+    .single()
+
+  // Enhanced profile error handling
+  if (profileError || !profile) {
+    console.warn(`Profile error for user ${user.id}:`, profileError?.message || 'Profile not found')
+    
+    try {
+      // Attempt to sign out with retry logic
+      let signOutError = null
+      for (let i = 0; i < 3; i++) {
+        const { error } = await supabase.auth.signOut()
+        if (!error) break
+        signOutError = error
+        await new Promise(resolve => setTimeout(resolve, 100 * (i + 1)))
+      }
+      
+      if (signOutError) {
+        console.error('Failed to sign out user after profile error:', signOutError)
+      }
+    } catch (signOutError) {
+      console.error('Critical: Unable to sign out user with profile error:', signOutError)
+    }
+    
+    if (pathname.startsWith('/api/')) {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Authentication failed',
+          message: 'Please sign in again',
+          code: 'AUTH_PROFILE_ERROR'
+        }),
+        { 
+          status: 401,
+          headers: { 
+            'Content-Type': 'application/json',
+            'Clear-Site-Data': '"cookies", "storage"'
+          }
+        }
+      )
+    }
+
+    return NextResponse.redirect(new URL('/auth/signin', request.url))
+  }
+
+  // Check if account is active
+  if (!profile.is_active) {
+    if (pathname.startsWith('/api/')) {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Account inactive',
+          message: 'Your account has been deactivated',
+          code: 'ACCOUNT_INACTIVE'
+        }),
+        { 
+          status: 403,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    }
+
+    return NextResponse.redirect(new URL('/auth/account-inactive', request.url))
+  }
+
+  // Check if password change is required
+  if (profile.require_password_change && !pathname.startsWith('/auth/change-password')) {
+    if (pathname.startsWith('/api/') && pathname !== '/api/auth/password/update') {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Password change required',
+          message: 'You must change your password before continuing',
+          code: 'PASSWORD_CHANGE_REQUIRED'
+        }),
+        { 
+          status: 403,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    }
+
+    if (!pathname.startsWith('/auth/change-password')) {
+      return NextResponse.redirect(new URL('/auth/change-password', request.url))
+    }
+  }
+
+  // Check if onboarding is required
+  if (!profile.onboarding_completed && !pathname.startsWith('/onboarding')) {
+    if (pathname.startsWith('/api/') && !pathname.startsWith('/api/auth/')) {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Onboarding required',
+          message: 'Please complete your profile setup',
+          code: 'ONBOARDING_REQUIRED'
+        }),
+        { 
+          status: 403,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    }
+
+    if (!pathname.startsWith('/onboarding') && !pathname.startsWith('/api/auth/')) {
+      return NextResponse.redirect(new URL('/onboarding', request.url))
+    }
+  }
+
+  // Check role-based access for protected routes
+  const userRole = profile.role
+  let hasAccess = false
+
+  // Check admin routes
+  if (protectedRoutes.admin.some(route => 
+    pathname === route || pathname.startsWith(`${route}/`)
+  )) {
+    hasAccess = userRole === 'admin'
+  }
+  // Check clerk routes (clerk and admin have access)
+  else if (protectedRoutes.clerk.some(route =>
+    pathname === route || pathname.startsWith(`${route}/`)
+  )) {
+    hasAccess = ['admin', 'clerk'].includes(userRole)
+  }
+  // Check authenticated routes (any logged in user)
+  else if (protectedRoutes.authenticated.some(route =>
+    pathname === route || pathname.startsWith(`${route}/`)
+  )) {
+    hasAccess = true
+  }
+  // For routes not specifically protected, allow access
+  else {
+    hasAccess = true
+  }
+
+  // Deny access if user doesn't have required role
+  if (!hasAccess) {
+    if (pathname.startsWith('/api/')) {
+      return new NextResponse(
+        JSON.stringify({
+          error: 'Insufficient permissions',
+          message: `Access denied. Required role not met.`,
+          code: 'INSUFFICIENT_PERMISSIONS',
+          userRole: userRole,
+          requiredPath: pathname
+        }),
+        { 
+          status: 403,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      )
+    }
+
+    return NextResponse.redirect(new URL('/unauthorized', request.url))
+  }
+
+  // Add user context headers for API routes
+  if (pathname.startsWith('/api/')) {
+    response.headers.set('X-User-ID', user.id)
+    response.headers.set('X-User-Role', userRole)
+    response.headers.set('X-User-Email', user.email || '')
+  }
+
+  return response
+}
+
+export const config = {
+  matcher: [
+    /*
+     * Match all request paths except for the ones starting with:
+     * - _next/static (static files)
+     * - _next/image (image optimization files)
+     * - favicon.ico (favicon file)
+     * - public files (public folder)
+     */
+    '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
+  ],
+}
