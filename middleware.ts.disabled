@@ -64,6 +64,7 @@ export async function middleware(request: NextRequest) {
   // Public routes that don't require authentication
   const publicRoutes = [
     '/',
+    '/test-db',
     '/auth/signin',
     '/auth/signup', 
     '/auth/reset-password',
@@ -82,20 +83,31 @@ export async function middleware(request: NextRequest) {
 
   // Protected routes that require specific roles
   const protectedRoutes = {
-    // Admin only routes
+    // Admin only routes - full system access
     admin: [
       '/admin',
       '/users/manage',
       '/api/auth/invite',
-      '/api/users'
+      '/api/users',
+      '/api/admin'
     ],
-    // Clerk and above
+    // Clerk routes - business operations (admin + clerk access)
     clerk: [
+      '/clerk',
       '/enquiries',
       '/clients',
       '/assignments',
+      '/workload',
+      '/reports',
       '/api/enquiries',
-      '/api/clients'
+      '/api/clients',
+      '/api/assignments',
+      '/api/reports'
+    ],
+    // Barrister routes - personal data only
+    barrister: [
+      '/barrister',
+      '/api/barrister'
     ],
     // Any authenticated user
     authenticated: [
@@ -257,17 +269,28 @@ export async function middleware(request: NextRequest) {
   const userRole = profile.role
   let hasAccess = false
 
-  // Check admin routes
+  // Check admin routes - admin only
   if (protectedRoutes.admin.some(route => 
     pathname === route || pathname.startsWith(`${route}/`)
   )) {
     hasAccess = userRole === 'admin'
   }
-  // Check clerk routes (clerk and admin have access)
+  // Check clerk routes - admin and clerk access
   else if (protectedRoutes.clerk.some(route =>
     pathname === route || pathname.startsWith(`${route}/`)
   )) {
     hasAccess = ['admin', 'clerk'].includes(userRole)
+  }
+  // Check barrister routes - all roles can access but with data isolation
+  else if (protectedRoutes.barrister.some(route =>
+    pathname === route || pathname.startsWith(`${route}/`)
+  )) {
+    hasAccess = ['admin', 'clerk', 'barrister'].includes(userRole)
+    // For barristers, add user ID header for data isolation
+    if (userRole === 'barrister' && pathname.startsWith('/api/')) {
+      response.headers.set('X-Barrister-ID', user.id)
+      response.headers.set('X-Data-Isolation', 'true')
+    }
   }
   // Check authenticated routes (any logged in user)
   else if (protectedRoutes.authenticated.some(route =>

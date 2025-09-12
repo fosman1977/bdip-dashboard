@@ -1,12 +1,13 @@
-import { createBrowserClient } from '@supabase/ssr'
-import { env } from '../env'
+import { createBrowserClient } from "@supabase/ssr";
 
-// Client-side Supabase client for browser usage
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
 export const createClient = () =>
   createBrowserClient(
-    env.NEXT_PUBLIC_SUPABASE_URL,
-    env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  )
+    supabaseUrl!,
+    supabaseKey!,
+  );
 
 // Legacy export for backwards compatibility (to be removed)
 export const supabase = createClient()
